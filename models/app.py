@@ -10,6 +10,9 @@ from facenet_pytorch import MTCNN, InceptionResnetV1
 from torchvision.utils import save_image
 from flask import Flask, request, jsonify, send_file
 import io
+from torchvision.utils import save_image
+from torchvision import transforms
+
 
 app = Flask(__name__)
 CORS(app)
@@ -332,35 +335,47 @@ def cloak_face_facenet(
     return perturbed, metrics
 
 
-@app.route("/face-cloak", methods=["POST"])
-def cloak_face_api():
+def pil_to_base64(pil_img, format="PNG"):
+    buffer = io.BytesIO()
+    pil_img.save(buffer, format=format)
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
+
+
+def base64_to_pil(b64_string):
+    img_bytes = base64.b64decode(b64_string)
+    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+
+def tensor_to_base64(tensor, format="PNG"):
+    buffer = io.BytesIO()
+    save_image(tensor, buffer, format=format)
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
+
+def face_cloak_from_base64(
+    image_b64: str,
+    intensity: float = 0.01,
+    method: str = "fgsm",
+    targeted: bool = False,
+    target_image_b64: str | None = None,
+):
     """
-    Inputs:
-        - file: image
-        - intensity: float
-        - method: fgsm or pgd
-        - targeted: "true" or "false"
-        - target_image: optional file (for targeted attacks)
-    Returns: cloaked image + metrics
+    Pure function:
+    - Takes images as base64
+    - Returns base64 cloaked image + metrics
     """
 
-    image_file = request.files.get("file")
-    if image_file is None:
-        return jsonify({"error": "No image file provided"}), 400
-
-    orig_img = Image.open(image_file).convert("RGB")
-
-    intensity = float(request.form.get("intensity", 0.01))
-    method = request.form.get("method", "fgsm").lower()
-    targeted = request.form.get("targeted", "false").lower() == "true"
+    # Decode input image
+    orig_img = base64_to_pil(image_b64)
 
     target_identity_img = None
     if targeted:
-        target_file = request.files.get("target_image")
-        if target_file is None:
-            return jsonify({"error": "Targeted attack requires target_image"}), 400
-        target_identity_img = Image.open(target_file).convert("RGB")
+        if target_image_b64 is None:
+            return None, {"error": "Targeted attack requires target_image"}
+        target_identity_img = base64_to_pil(target_image_b64)
 
+    # ---- CORE PROCESSING (UNCHANGED) ----
     perturbed_tensor, metrics = cloak_face_facenet(
         orig_img,
         intensity=intensity,
@@ -370,21 +385,120 @@ def cloak_face_api():
     )
 
     if perturbed_tensor is None:
+        return None, metrics
+
+    # Encode output tensor to base64
+    cloaked_b64 = tensor_to_base64(perturbed_tensor)
+
+    return cloaked_b64, metrics
+
+
+
+@app.route("/face-cloak", methods=["POST"])
+def cloak_face_api():
+    """
+    Accepts:
+    - multipart file OR image_base64
+    - optional target_image OR target_image_base64
+    """
+
+    # ---- INPUT IMAGE ----
+    image_b64 = request.form.get("image_base64")
+
+    if image_b64 is None:
+        image_file = request.files.get("file")
+        if image_file is None:
+            return jsonify({"error": "No image provided"}), 400
+        # convert multipart → base64
+        orig_img = Image.open(image_file).convert("RGB")
+        image_b64 = pil_to_base64(orig_img)
+
+    # ---- PARAMETERS ----
+    intensity = float(request.form.get("intensity", 0.01))
+    method = request.form.get("method", "fgsm").lower()
+    targeted = request.form.get("targeted", "false").lower() == "true"
+
+    # ---- TARGET IMAGE (optional) ----
+    target_image_b64 = request.form.get("target_image_base64")
+
+    if targeted and target_image_b64 is None:
+        target_file = request.files.get("target_image")
+        if target_file is None:
+            return jsonify({"error": "Targeted attack requires target_image"}), 400
+        target_img = Image.open(target_file).convert("RGB")
+        target_image_b64 = pil_to_base64(target_img)
+
+    # ---- CALL PURE FUNCTION ----
+    cloaked_b64, metrics = face_cloak_from_base64(
+        image_b64=image_b64,
+        intensity=intensity,
+        method=method,
+        targeted=targeted,
+        target_image_b64=target_image_b64
+    )
+
+    if cloaked_b64 is None:
         return jsonify(metrics), 400
 
-    buffer = io.BytesIO()
-    save_image(perturbed_tensor, buffer, format="PNG")
-    buffer.seek(0)
-
-    perturbed_tensor_pil = transforms.ToPILImage()(perturbed_tensor.squeeze(0).cpu())
-    perturbed_tensor_pil.save("facecloaked.png")
-    with open("facecloaked.png", "rb") as img_file:
-        encoded_string = base64.b64encode(img_file.read()).decode("utf-8")
-
     return jsonify({
-        "cloaked_image": encoded_string,
+        "cloaked_image": cloaked_b64,
         "response": metrics
     }), 200
+
+
+# @app.route("/face-cloak", methods=["POST"])
+# def cloak_face_api():
+#     """
+#     Inputs:
+#         - file: image
+#         - intensity: float
+#         - method: fgsm or pgd
+#         - targeted: "true" or "false"
+#         - target_image: optional file (for targeted attacks)
+#     Returns: cloaked image + metrics
+#     """
+
+#     image_file = request.files.get("file")
+#     if image_file is None:
+#         return jsonify({"error": "No image file provided"}), 400
+
+#     orig_img = Image.open(image_file).convert("RGB")
+
+#     intensity = float(request.form.get("intensity", 0.01))
+#     method = request.form.get("method", "fgsm").lower()
+#     targeted = request.form.get("targeted", "false").lower() == "true"
+
+#     target_identity_img = None
+#     if targeted:
+#         target_file = request.files.get("target_image")
+#         if target_file is None:
+#             return jsonify({"error": "Targeted attack requires target_image"}), 400
+#         target_identity_img = Image.open(target_file).convert("RGB")
+
+#     perturbed_tensor, metrics = cloak_face_facenet(
+#         orig_img,
+#         intensity=intensity,
+#         method=method,
+#         targeted=targeted,
+#         target_identity_img=target_identity_img
+#     )
+
+#     if perturbed_tensor is None:
+#         return jsonify(metrics), 400
+
+#     buffer = io.BytesIO()
+#     save_image(perturbed_tensor, buffer, format="PNG")
+#     buffer.seek(0)
+
+#     perturbed_tensor_pil = transforms.ToPILImage()(perturbed_tensor.squeeze(0).cpu())
+#     perturbed_tensor_pil.save("facecloaked.png")
+#     with open("facecloaked.png", "rb") as img_file:
+#         encoded_string = base64.b64encode(img_file.read()).decode("utf-8")
+
+#     return jsonify({
+#         "cloaked_image": encoded_string,
+#         "response": metrics
+#     }), 200
 
 if __name__ == "__main__":
     app.run(debug=True, port = 8080)
