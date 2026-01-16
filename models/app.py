@@ -29,42 +29,27 @@ preprocess_224 = transforms.Compose([
 ])
 
 to_tensor = transforms.ToTensor()
-
-def fgsm_highres_cloak(orig_img, target_class, intensity):
-    orig_w, orig_h = orig_img.size
-
-    x_small = preprocess_224(orig_img).unsqueeze(0).to(device)
-    x_small.requires_grad = True
-
-    output = resnet(x_small)
-    loss = output[0, target_class]
-
-    loss.backward()
-
-    epsilon = intensity
-    grad_sign = x_small.grad.data.sign()
-
-    pert_small = torch.clamp(x_small - epsilon * grad_sign, 0, 1).detach()
-
-    delta_small = pert_small - x_small
-
-    delta_big = torch.nn.functional.interpolate(
-        delta_small,
-        size=(orig_h, orig_w),
-        mode='bilinear',
-        align_corners=False
-    )
-
-    orig_tensor = to_tensor(orig_img).unsqueeze(0).to(device)
-
-    perturbed_highres = torch.clamp(orig_tensor + delta_big, 0, 1)
-
-    return perturbed_highres
-# required imports
-
 # ImageNet normalization (update if your preprocess_224 uses different values)
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+
+def pil_to_base64(pil_img, format="PNG"):
+    buffer = io.BytesIO()
+    pil_img.save(buffer, format=format)
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
+
+
+def base64_to_pil(b64_string):
+    img_bytes = base64.b64decode(b64_string)
+    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+
+def tensor_to_base64(tensor, format="PNG"):
+    buffer = io.BytesIO()
+    save_image(tensor, buffer, format=format)
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
 
 def fgsm_highres_cloak(pil_img, target_idx, epsilon=0.01, targeted=False):
     """
@@ -116,20 +101,22 @@ def fgsm_highres_cloak(pil_img, target_idx, epsilon=0.01, targeted=False):
     return perturbed_orig_px  # [1,3,H,W] in original resolution, ready to save
 
 
-@app.route("/art-cloak", methods=["POST"])
-def cloak_image():
-    image_file = request.files.get("image")
-    target_class_name = request.form.get("target_class", None)
-    intensity = float(request.form.get("intensity", 0.01))
-    mode = request.form.get("mode", "untargeted")
+def art_cloak_from_base64(
+    image_b64: str,
+    intensity: float = 0.01,
+    mode: str = "untargeted",
+    target_class_name: str | None = None,
+):
+    """
+    Pure function:
+    - Input images as base64
+    - Output cloaked image as base64 + predictions
+    """
 
-    if image_file is None:
-        return jsonify({"error": "No image file provided"}), 400
+    # Decode input image
+    orig_img = base64_to_pil(image_b64)
 
-    # Load original image at full resolution
-    orig_img = Image.open(image_file).convert("RGB")
-
-    # --- BEFORE PREDICTIONS (model input space only) ---
+    # --- BEFORE PREDICTIONS ---
     with torch.no_grad():
         x_before = preprocess_224(orig_img).unsqueeze(0).to(device)
         probs_before = F.softmax(resnet(x_before), dim=1)[0]
@@ -144,18 +131,17 @@ def cloak_image():
         try:
             target_idx = idx_to_class.index(target_class_name)
         except ValueError:
-            return jsonify({"error": "Invalid class name"}), 400
+            return None, {"error": "Invalid class name"}
 
-    # --- HIGH-RES CLOAKING (NO RESIZE OF OUTPUT IMAGE) ---
+    # --- HIGH-RES CLOAKING (UNCHANGED) ---
     perturbed_tensor = fgsm_highres_cloak(
         pil_img=orig_img,
         target_idx=target_idx,
         epsilon=intensity,
         targeted=targeted
     )
-    # perturbed_tensor shape: [1, 3, H, W]  (original H,W)
 
-    # --- AFTER PREDICTIONS (resize only for model, NOT output) ---
+    # --- AFTER PREDICTIONS ---
     with torch.no_grad():
         pert_img_pil = transforms.ToPILImage()(
             perturbed_tensor.squeeze(0).cpu()
@@ -185,16 +171,130 @@ def cloak_image():
         ],
     }
 
-    # --- RETURN FULL-RES IMAGE ---
-    buffer = io.BytesIO()
-    save_image(perturbed_tensor, buffer, format="PNG")  # preserves original size
-    buffer.seek(0)
-    encoded_string = base64.b64encode(buffer.read()).decode("utf-8")
+    cloaked_b64 = tensor_to_base64(perturbed_tensor)
+
+    return cloaked_b64, response
+
+
+# @app.route("/art-cloak", methods=["POST"])
+# def cloak_image():
+#     image_file = request.files.get("image")
+#     target_class_name = request.form.get("target_class", None)
+#     intensity = float(request.form.get("intensity", 0.01))
+#     mode = request.form.get("mode", "untargeted")
+
+#     if image_file is None:
+#         return jsonify({"error": "No image file provided"}), 400
+
+#     # Load original image at full resolution
+#     orig_img = Image.open(image_file).convert("RGB")
+
+#     # --- BEFORE PREDICTIONS (model input space only) ---
+#     with torch.no_grad():
+#         x_before = preprocess_224(orig_img).unsqueeze(0).to(device)
+#         probs_before = F.softmax(resnet(x_before), dim=1)[0]
+
+#     targeted = (mode == "targeted")
+
+#     # Resolve target class
+#     if target_class_name is None:
+#         target_idx = torch.argmax(probs_before).item()
+#         target_class_name = idx_to_class[target_idx]
+#     else:
+#         try:
+#             target_idx = idx_to_class.index(target_class_name)
+#         except ValueError:
+#             return jsonify({"error": "Invalid class name"}), 400
+
+#     # --- HIGH-RES CLOAKING (NO RESIZE OF OUTPUT IMAGE) ---
+#     perturbed_tensor = fgsm_highres_cloak(
+#         pil_img=orig_img,
+#         target_idx=target_idx,
+#         epsilon=intensity,
+#         targeted=targeted
+#     )
+#     # perturbed_tensor shape: [1, 3, H, W]  (original H,W)
+
+#     # --- AFTER PREDICTIONS (resize only for model, NOT output) ---
+#     with torch.no_grad():
+#         pert_img_pil = transforms.ToPILImage()(
+#             perturbed_tensor.squeeze(0).cpu()
+#         )
+#         x_after = preprocess_224(pert_img_pil).unsqueeze(0).to(device)
+#         probs_after = F.softmax(resnet(x_after), dim=1)[0]
+
+#     top_before = torch.topk(probs_before, 3)
+#     top_after = torch.topk(probs_after, 3)
+
+#     response = {
+#         "mode": mode,
+#         "target_class": target_class_name,
+#         "original_top_predictions": [
+#             {
+#                 "class": idx_to_class[top_before.indices[i]],
+#                 "prob": float(top_before.values[i])
+#             }
+#             for i in range(3)
+#         ],
+#         "cloaked_top_predictions": [
+#             {
+#                 "class": idx_to_class[top_after.indices[i]],
+#                 "prob": float(top_after.values[i])
+#             }
+#             for i in range(3)
+#         ],
+#     }
+
+#     # --- RETURN FULL-RES IMAGE ---
+#     buffer = io.BytesIO()
+#     save_image(perturbed_tensor, buffer, format="PNG")  # preserves original size
+#     buffer.seek(0)
+#     encoded_string = base64.b64encode(buffer.read()).decode("utf-8")
+
+#     return jsonify({
+#         "cloaked_image": encoded_string,
+#         "response": response
+#     }), 200
+    
+@app.route("/art-cloak", methods=["POST"])
+def cloak_image():
+    """
+    Accepts:
+    - multipart image OR image_base64
+    - optional target_class
+    """
+
+    # ---- IMAGE INPUT ----
+    image_b64 = request.form.get("image_base64")
+
+    if image_b64 is None:
+        image_file = request.files.get("image")
+        if image_file is None:
+            return jsonify({"error": "No image provided"}), 400
+        orig_img = Image.open(image_file).convert("RGB")
+        image_b64 = pil_to_base64(orig_img)
+
+    # ---- PARAMS ----
+    target_class_name = request.form.get("target_class", None)
+    intensity = float(request.form.get("intensity", 0.01))
+    mode = request.form.get("mode", "untargeted")
+
+    # ---- CALL PURE FUNCTION ----
+    cloaked_b64, response = art_cloak_from_base64(
+        image_b64=image_b64,
+        intensity=intensity,
+        mode=mode,
+        target_class_name=target_class_name
+    )
+
+    if cloaked_b64 is None:
+        return jsonify(response), 400
 
     return jsonify({
-        "cloaked_image": encoded_string,
+        "cloaked_image": cloaked_b64,
         "response": response
     }), 200
+
 
 
 @app.route("/")
@@ -335,23 +435,7 @@ def cloak_face_facenet(
     return perturbed, metrics
 
 
-def pil_to_base64(pil_img, format="PNG"):
-    buffer = io.BytesIO()
-    pil_img.save(buffer, format=format)
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
 
-
-def base64_to_pil(b64_string):
-    img_bytes = base64.b64decode(b64_string)
-    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-
-def tensor_to_base64(tensor, format="PNG"):
-    buffer = io.BytesIO()
-    save_image(tensor, buffer, format=format)
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
 
 def face_cloak_from_base64(
     image_b64: str,
