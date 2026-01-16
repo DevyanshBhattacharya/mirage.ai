@@ -331,6 +331,7 @@ def cloak_face_facenet(
 
     return perturbed, metrics
 
+
 @app.route("/face-cloak", methods=["POST"])
 def cloak_face_api():
     """
